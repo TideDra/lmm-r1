@@ -45,7 +45,7 @@ class WorkerWrap:
         else:
             torch.distributed.broadcast(weight, 0, group=self._model_update_group)
 
-        self.model_runner.model.load_weights(weights=[(name, weight)])
+        self.get_model().load_weights(weights=[(name, weight)])
 
         del weight
         # TODO: should we empty cache if all weights have updated?
@@ -69,5 +69,5 @@ class WorkerWrap:
         # in case two processes have different CUDA_VISIBLE_DEVICES
         list_args[6] = device_id
         weight = func(*list_args)
-        self.model_runner.model.load_weights(weights=[(name, weight)])
+        self.get_model().load_weights(weights=[(name, weight)])
         torch.cuda.synchronize()

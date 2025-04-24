@@ -61,7 +61,8 @@ def train(args):
             pg if args.colocate_all_models else None,
             args.vllm_gpu_memory_utilization,
             args.vllm_enable_sleep,
-            limit_mm_per_prompt=args.limit_mm_per_prompt
+            limit_mm_per_prompt=args.limit_mm_per_prompt,
+            **args.vllm_engine_kwargs
         )
 
     actor_model = PPORayActorGroup(
@@ -233,6 +234,7 @@ if __name__ == "__main__":
         help="vLLM gpu_memory_utilization",
     )
     parser.add_argument("--limit_mm_per_prompt", type=str, default=None, help="Limit the number of multimodal inputs per prompt")
+    parser.add_argument("--vllm_engine_kwargs", type=str, default=None, help="vLLM engine kwargs")
 
     # Checkpoints
     parser.add_argument("--eval_steps", type=int, default=-1)
@@ -497,5 +499,10 @@ if __name__ == "__main__":
         except json.JSONDecodeError:
             raise ValueError(f"Invalid Json string for --limit_mm_per_prompt: {args.limit_mm_per_prompt}")
 
+    if args.vllm_engine_kwargs:
+        import json
+        args.vllm_engine_kwargs = json.loads(args.vllm_engine_kwargs)
+    else:
+        args.vllm_engine_kwargs = {}
 
     train(args)
