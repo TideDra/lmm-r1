@@ -66,18 +66,19 @@ class BasePPORole(DistributedTorchRayActor):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def execute_batch(self, method_name: str, **kwargs):
+    def execute_batch(self, method_name: str, all_data, start_idx, end_idx):
         """Process input data by calling specified function for each item in the lists.
 
         Args:
             method_name (str): Name of the function to execute
-            **kwargs: Input parameters in list format. Each parameter should be a list with same length.
-                     The first parameter's length determines the number of function calls.
+            kwargs: Reference to the chunk of data to process
 
         Returns:
             List[Any]: List of results from function execution
         """
+
         # Get the first parameter to determine list length
+        kwargs = {key: value[start_idx:end_idx] for key, value in all_data.items()}
         first_param = next(iter(kwargs.values()))
         list_length = len(first_param)
 
@@ -214,14 +215,15 @@ class PPORayActorGroup:
         ray_actor_type: Type[BasePPORole],
         pg: PlacementGroup = None,
         num_gpus_per_actor=1,
-        ring_attn_size: int = 1,
+        duplicate_actors: int = 1,
         resources: Dict[str, float] = None,
         num_resources_per_node: int = None,
     ) -> None:
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
         self.ray_actor_type = ray_actor_type
-        self.ring_attn_size = ring_attn_size
+        # duplicate actors is ring_attn_size * tensor_parallel_size
+        self.duplicate_actors = duplicate_actors
 
         # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         self._resources = resources
@@ -310,7 +312,7 @@ class PPORayActorGroup:
 
     def async_run_method_batch(self, method_name, **kwargs):
         """Run method on all actors with batched input data asynchronously using round-robin scheduling.
-        Each actor processes one chunk of data at a time. Actors in the same ring group process the same chunk.
+        Each actor processes one chunk of data at a time. Actors in the same ring / tensor parallel group process the same chunk.
 
         Args:
             method_name (str): Name of the method to run
@@ -337,7 +339,7 @@ class PPORayActorGroup:
 
         # Calculate chunk size based on number of effective actors (considering ring groups)
         num_actors = len(self._actor_handlers)
-        effective_actors = num_actors // self.ring_attn_size
+        effective_actors = num_actors // self.duplicate_actors
         chunk_size = total_length // effective_actors
         assert (
             total_length >= effective_actors
@@ -345,20 +347,17 @@ class PPORayActorGroup:
         if total_length % effective_actors != 0:
             chunk_size += 1
 
+        all_data_ref = ray.put(kwargs)
+
         refs = []
-        for i in range(0, total_length, chunk_size):
-            # Prepare chunked data
-            chunk_kwargs = {}
-            for key, value in kwargs.items():
-                chunk_kwargs[key] = value[i : i + chunk_size]
+        for chunk_idx in range(effective_actors):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min((chunk_idx + 1) * chunk_size, total_length)
 
-            # Calculate which ring group should handle this chunk
-            ring_group_idx = (i // chunk_size) % effective_actors
-
-            # Send the same chunk to all actors in the ring group
-            for j in range(self.ring_attn_size):
-                actor_idx = ring_group_idx * self.ring_attn_size + j
+            for j in range(self.duplicate_actors):
+                actor_idx = chunk_idx * self.duplicate_actors + j
                 actor = self._actor_handlers[actor_idx]
-                refs.append(actor.execute_batch.remote(method_name, **chunk_kwargs))
+
+                refs.append(actor.execute_batch.remote(method_name, all_data_ref, start_idx, end_idx))
 
         return refs

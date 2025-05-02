@@ -70,7 +70,7 @@ def train(args):
         ActorModelRayActor,
         pg=pg,
         num_gpus_per_actor=0.2 if pg else 1,
-        ring_attn_size=args.ring_attn_size,
+        duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
     )
 
     if args.init_kl_coef <= 0:
@@ -82,7 +82,7 @@ def train(args):
             ReferenceModelRayActor,
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
-            ring_attn_size=args.ring_attn_size,
+            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
 
     if not args.colocate_all_models:
@@ -106,7 +106,7 @@ def train(args):
             CriticModelRayActor,
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
-            ring_attn_size=args.ring_attn_size,
+            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
         critic_model = None
@@ -120,7 +120,7 @@ def train(args):
             RewardModelRayActor,
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
-            ring_attn_size=args.ring_attn_size,
+            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
         reward_model = None
@@ -272,6 +272,7 @@ if __name__ == "__main__":
         default=False,
         help="Enable sleep mode for deepspeed when using --colocate_all_models",
     )
+    parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed tensor parallel size")
 
     # packing samples using Flash Attention2
     parser.add_argument("--packing_samples", action="store_true", default=False)
@@ -388,7 +389,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt_split", type=str, default="train")
     parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
-    parser.add_argument("--eval_split", type=str, default="test")
+    parser.add_argument("--eval_split", type=str, default="train")
     parser.add_argument("--eval_temperature", type=float, default=0.6, help="Temperature for evaluation")
     parser.add_argument(
         "--eval_n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"

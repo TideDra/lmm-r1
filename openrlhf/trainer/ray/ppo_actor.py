@@ -240,7 +240,7 @@ class ActorPPOTrainer(ABC):
             else:
                 kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
             kl_loss = masked_mean(kl, experience.action_mask)
-            experience.info["kl"] = kl_loss.detach().item()
+            experience.info["kl"] = kl_loss.detach()
         else:
             kl_loss = 0
 
@@ -293,65 +293,6 @@ class ActorPPOTrainer(ABC):
             leaf_modules = [(n,m) for n,m in leaf_modules if not any([keyword in n for keyword in lora_module_keyword])]
         return leaf_modules
 
-    def _broadcast_module(self,module,prefix=None,empty_cache=False,need_gather=False):
-        count, num_params = 0, len(list(module.named_parameters()))
-        for name, param in module.named_parameters(prefix=prefix):
-            # broadcast
-            count += 1
-            if not self.use_cuda_ipc:
-                use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
-                # Fire all vllm engines for broadcast
-                if torch.distributed.get_rank() == 0:
-                    shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                    refs = [
-                        engine.update_weight.remote(
-                            name, dtype=param.dtype, shape=shape, empty_cache=empty_cache and count==num_params,
-                        )
-                        for engine in self.vllm_engines
-                    ]
-
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=need_gather):
-                    if torch.distributed.get_rank() == 0:
-                        if use_ray:
-                            import ray.util.collective as collective
-
-                            collective.broadcast(param.data, 0, group_name=self._model_update_group)
-                        else:
-                            torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
-                        ray.get(refs)
-            # CUDA IPC
-            else:
-                from torch.multiprocessing.reductions import reduce_tensor
-
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                with deepspeed.zero.GatheredParameters([param], enabled=need_gather):
-                    weight = param.data.clone()
-                    ipc_handle = reduce_tensor(weight)
-
-                    ipc_handle = {get_physical_gpu_id(): ipc_handle}
-                    ipc_handle_list = [None] * torch.distributed.get_world_size()
-                    torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
-
-                    if torch.distributed.get_rank() == 0:
-                        ipc_handles = {}
-                        for d in ipc_handle_list:
-                            ipc_handles.update(d)
-
-                        shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
-                        refs = [
-                            engine.update_weight_cuda_ipc.remote(
-                                name,
-                                dtype=param.dtype,
-                                shape=shape,
-                                ipc_handles=ipc_handles,
-                                empty_cache=empty_cache and count==num_params,
-                            )
-                            for engine in self.vllm_engines
-                        ]
-                        ray.get(refs)
-                    torch_dist_barrier_and_cuda_sync()
-
     def _broadcast_to_vllm(self):
         use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
         cache_reset_refs = []
@@ -369,16 +310,66 @@ class ActorPPOTrainer(ABC):
             use_lora = True
 
         leaf_modules = self._get_leaf_modules(model,use_lora) # parameters of leaf_modules should not overlap
-        count, num_modules = 0, len(leaf_modules)
+        module_count, num_modules = 0, len(leaf_modules)
+
+        def _broadcast_param(param, count, num_params):
+            use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+            # Fire all vllm engines for broadcast
+            if torch.distributed.get_rank() == 0:
+                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                refs = [
+                    engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+                    for engine in self.vllm_engines
+                ]
+
+                if use_ray:
+                    import ray.util.collective as collective
+
+                    collective.broadcast(param.data, 0, group_name=self._model_update_group)
+                else:
+                    torch.distributed.broadcast(param.data, 0, group=self._model_update_group)
+                ray.get(refs)
+
+        def _handle_cuda_ipc(param, count, num_params):
+            from torch.multiprocessing.reductions import reduce_tensor
+
+            weight = param.data.clone()
+            ipc_handle = reduce_tensor(weight)
+
+            ipc_handle = {get_physical_gpu_id(): ipc_handle}
+            ipc_handle_list = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(ipc_handle_list, ipc_handle)
+
+            if torch.distributed.get_rank() == 0:
+                ipc_handles = {}
+                for d in ipc_handle_list:
+                    ipc_handles.update(d)
+
+                shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+                refs = [
+                    engine.update_weight_cuda_ipc.remote(
+                        name,
+                        dtype=param.dtype,
+                        shape=shape,
+                        ipc_handles=ipc_handles,
+                        empty_cache=count == num_params,
+                    )
+                    for engine in self.vllm_engines
+                ]
+                ray.get(refs)
+            torch_dist_barrier_and_cuda_sync()
         for key,module in leaf_modules:
-            count += 1
+            module_count += 1
             with ExitStack() as stack:
-                need_gather = self.strategy.args.zero_stage == 3
+                need_gather = self.strategy.args.zero_stage == 3 or self.strategy.args.ds_tensor_parallel_size > 1
                 module_name = key.split(".")[-1]
                 raw_module = module
                 if use_lora and hasattr(raw_module, "base_layer"):
                     #This is a lora module
-                    stack.enter_context(deepspeed.zero.GatheredParameters(raw_module.parameters(), enabled=need_gather))
+                    if self.strategy.args.ds_tensor_parallel_size > 1:
+                      stack.enter_context(deepspeed.module_inject.layers.GatherReplacedLayerParams(raw_module.parameters(), model, enabled=need_gather))
+                    else:
+                      stack.enter_context(deepspeed.zero.GatheredParameters(raw_module.parameters(), enabled=need_gather))
                     raw_module.merge(safe_merge=True)
                     # we don't really replace the module, but we utilize _replace_module to get the merged module
                     fake_parent = type('FakeParent',(),{})()
@@ -386,8 +377,26 @@ class ActorPPOTrainer(ABC):
                     module = getattr(fake_parent, module_name)
                     need_gather = False
                     stack.callback(raw_module.unmerge)
-
-                self._broadcast_module(module, prefix=key, empty_cache=count==num_modules,need_gather=need_gather)
+                count_param, num_param = 0, len(list(module.named_parameters()))
+                for name, param in module.named_parameters(prefix=key):
+                    count_param += 1  # empty_cache at last param
+                    # broadcast
+                    if not self.use_cuda_ipc:
+                        # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
+                        if self.strategy.args.ds_tensor_parallel_size > 1:
+                            with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=need_gather):
+                                _broadcast_param(param, count_param, num_param if module_count == num_modules else -1)
+                        else:
+                            with deepspeed.zero.GatheredParameters([param], enabled=need_gather):
+                                _broadcast_param(param, count_param, num_param if module_count == num_modules else -1)
+                    # CUDA IPC
+                    else:
+                        if self.strategy.args.ds_tensor_parallel_size > 1:
+                            with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=need_gather):
+                                _handle_cuda_ipc(param, count_param, num_param if module_count == num_modules else -1)
+                        else:
+                            with deepspeed.zero.GatheredParameters([param], enabled=need_gather):
+                                _handle_cuda_ipc(param, count_param, num_param if module_count == num_modules else -1)
 
         if cache_reset_refs:
             ray.get(cache_reset_refs)

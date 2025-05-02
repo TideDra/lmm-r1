@@ -9,6 +9,8 @@ from typing import List, Optional, Tuple, Union, Dict
 import ray
 import torch
 from openrlhf.models.lmm_kits.base.data_processor import BaseDataProcessor, MMInputs
+
+from openrlhf.datasets.utils import zero_pad_sequences
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean, process_sequences
 from openrlhf.trainer.ray.launcher import PPORayActorGroup
 from openrlhf.utils.logging_utils import init_logger
@@ -120,7 +122,7 @@ class Samples:
     response_length: torch.Tensor
     total_length: torch.Tensor
     prompts: list[str]
-    visual_inputs: list[MMInputs]
+    visual_inputs: MMInputs
     labels: list[str]
 
     def __init__(
@@ -149,6 +151,7 @@ class Samples:
         sequences_list = self.sequences.split(split_size, dim=0)
         attention_mask_list = self.attention_mask.split(split_size, dim=0)
         action_mask_list = self.action_mask.split(split_size, dim=0)
+        visual_inputs_list = data_processor.split_input_batch(self.visual_inputs, split_size)
         sample_list = []
         for i, (seq, mask, action_mask) in enumerate(zip(sequences_list, attention_mask_list, action_mask_list)):
             sample = Samples()
@@ -159,7 +162,7 @@ class Samples:
             sample.total_length = sample.attention_mask.float().sum(dim=-1)
             sample.prompts = self.prompts[i * split_size : (i + 1) * split_size]
             sample.labels = self.labels[i * split_size : (i + 1) * split_size]
-            sample.visual_inputs = data_processor.make_input_batch(self.visual_inputs[i * split_size : (i + 1) * split_size])
+            sample.visual_inputs = data_processor.make_input_batch(visual_inputs_list[i * split_size : (i + 1) * split_size])
             sample_list.append(sample)
         return sample_list
 
@@ -255,19 +258,16 @@ class RemoteExperienceMaker(ABC):
         return experiences
 
     @torch.no_grad()
-    def make_experience(self, rollout_samples: Samples) -> List[Experience]:
+    def make_experience(self, samples_list: List[Samples]) -> List[Experience]:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
         start_time = time.time()
-        logger.info(f"🚀 Starting experience making with {len(rollout_samples.sequences)} batches")
+        logger.info(f"🚀 Starting experience making with {len(samples_list[0].sequences) * len(samples_list)} batches")
 
         args = self.strategy.args
         device = "cpu"
         experiences = []
-
-        # Split samples into smaller batches for batched actor/critic/reward/ref forward pass
-        samples_list = rollout_samples.split(args.micro_rollout_batch_size, self.data_processor)
 
         # Extract all information from samples in one pass
         # Convert samples into lists of tensors and metadata for batch processing
@@ -360,7 +360,7 @@ class RemoteExperienceMaker(ABC):
                 ray.get(value_ref)
                 ray.get(self.critic_model_group.async_run_method(method_name="empty_cache"))
         else:
-            value_ref = ray.put([[None]] * (len(samples_list) * args.ring_attn_size))
+            value_ref = ray.put([[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size))
 
         # Batch call initial model
         if self.initial_model_group is not None:
@@ -376,16 +376,19 @@ class RemoteExperienceMaker(ABC):
                 ray.get(base_action_log_probs_ref)
                 ray.get(self.initial_model_group.async_run_method(method_name="empty_cache"))
         else:
-            base_action_log_probs_ref = ray.put([[None]] * (len(samples_list) * args.ring_attn_size))
+            base_action_log_probs_ref = ray.put(
+                [[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size)
+            )
 
         # Wait for all remote calls to complete and flatten the results
-        # Note: the results duplicated ring_attn_size times
-        action_log_probs_list = sum(ray.get(action_log_probs_ref)[:: args.ring_attn_size], [])
-        base_action_log_probs_list = sum(ray.get(base_action_log_probs_ref)[:: args.ring_attn_size], [])
-        value_list = sum(ray.get(value_ref)[:: args.ring_attn_size], [])
+        # Note: the results duplicated ring_attn_size * ds_tensor_parallel_size times
+        duplicate_factor = args.ring_attn_size * args.ds_tensor_parallel_size
+        action_log_probs_list = sum(ray.get(action_log_probs_ref)[::duplicate_factor], [])
+        base_action_log_probs_list = sum(ray.get(base_action_log_probs_ref)[::duplicate_factor], [])
+        value_list = sum(ray.get(value_ref)[::duplicate_factor], [])
         rewards_list = ray.get(r_refs)
         if self.remote_rm_url is None:
-            rewards_list = sum(rewards_list[:: args.ring_attn_size], [])
+            rewards_list = sum(rewards_list[::duplicate_factor], [])
         else:
             rewards_list = torch.cat(rewards_list, dim=0).chunk(len(samples_list))
 
@@ -395,7 +398,7 @@ class RemoteExperienceMaker(ABC):
             == len(base_action_log_probs_list)
             == len(value_list)
             == len(rewards_list)
-        )
+        ), f"len(samples_list): {len(samples_list)}, len(action_log_probs_list): {len(action_log_probs_list)}, len(base_action_log_probs_list): {len(base_action_log_probs_list)}, len(value_list): {len(value_list)}, len(rewards_list): {len(rewards_list)}"
 
         # Process results for each sample
         for i, (samples, action_log_probs, base_action_log_probs, value, rewards) in enumerate(
@@ -533,8 +536,8 @@ class RemoteExperienceMaker(ABC):
                 all_advantages.append(exp.advantages)
                 all_action_masks.append(exp.action_mask)
 
-            advantages_vector = torch.cat(all_advantages).float().flatten()
-            action_masks_vector = torch.cat(all_action_masks).flatten()
+            advantages_vector = zero_pad_sequences(all_advantages).float().flatten()
+            action_masks_vector = zero_pad_sequences(all_action_masks).flatten()
             num_actions = action_masks_vector.sum()
 
             # mean
@@ -634,7 +637,7 @@ class RemoteExperienceMaker(ABC):
         return returns
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> Samples:
+    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -648,10 +651,10 @@ class RemoteExperienceMaker(ABC):
         return self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
 
     @torch.no_grad()
-    def _generate_with_hf(self, all_prompts: List[str], all_labels, **generate_kwargs) -> Samples:
+    def _generate_with_hf(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
         raise NotImplementedError("HF generation is not implemented yet")
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> Samples:
+    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Samples]:
         from vllm import SamplingParams
 
         llms = self.vllm_engines
@@ -699,55 +702,52 @@ class RemoteExperienceMaker(ABC):
             all_output_refs.append(llm.get_responses.remote(0))
         all_outputs = sum(ray.get(all_output_refs), [])
 
-        #
-        # NOTE: concat all outputs to following format:
-        #
-        # | [PAD] [PAD] token token token | token token [EOS] [PAD] |
-        # | token token token token token | token token [EOS] [PAD] |
-        # | [PAD] [PAD] [PAD] token token | token token token [EOS] |
-        # |<---------- prompt ----------->|<-------- answer ------->|
-        max_input_len, max_output_len = 0, 0
-        for output in all_outputs:
-            max_input_len = max(max_input_len, len(output.prompt_token_ids))
-            max_output_len = max(max_output_len, len(output.outputs[0].token_ids))
-
         pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
-        sequences = []
-        for output in all_outputs:
-            # left padding input
-            # TODO(gzpan): check if trunc input to max_input_len?
-            input_len = len(output.prompt_token_ids)
-            input_ids = [pad_token_id] * (max_input_len - input_len) + list(output.prompt_token_ids)
 
-            # right padding output
-            # TODO(gzpan): check if trunc output to max_output_len?
-            output_len = len(output.outputs[0].token_ids)
-            output_ids = list(output.outputs[0].token_ids) + [pad_token_id] * (max_output_len - output_len)
+        # Group outputs by micro_rollout_batch_size
+        samples_list = []
+        for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
+            batch_outputs = all_outputs[i : i + args.micro_rollout_batch_size]
+            batch_prompts = all_prompts[i : i + args.micro_rollout_batch_size]
+            batch_labels = all_labels[i : i + args.micro_rollout_batch_size]
 
-            # concat input and output
-            sequences.append(input_ids + output_ids)
+            # Calculate max lengths for this batch only
+            batch_max_input_len = max(len(output.prompt_token_ids) for output in batch_outputs)
+            batch_max_output_len = max(len(output.outputs[0].token_ids) for output in batch_outputs)
 
-        sequences = torch.tensor(sequences)
-        sequences, attention_mask, action_mask = process_sequences(
-            sequences, max_input_len, eos_token_id, pad_token_id
-        )
-        sequences = sequences.to("cpu")
-        attention_mask = attention_mask.to("cpu")
-        action_mask = action_mask.to("cpu")
-        response_length = action_mask.float().sum(dim=-1)
-        total_length = attention_mask.float().sum(dim=-1)
+            sequences = []
+            for output in batch_outputs:
+                # left padding input
+                input_len = len(output.prompt_token_ids)
+                input_ids = [pad_token_id] * (batch_max_input_len - input_len) + list(output.prompt_token_ids)
 
-        visual_inputs = self.data_processor(all_prompts, self.prompt_max_len, device="cpu")
-        visual_inputs = self.data_processor.split_input_batch(visual_inputs)
-        rollout_samples = Samples(
-            sequences=sequences,
-            attention_mask=attention_mask,
-            action_mask=action_mask,
-            response_length=response_length,
-            total_length=total_length,
-            prompts=all_prompts,
-            visual_inputs=visual_inputs,
-            labels=all_labels,
-        )
+                # right padding output
+                output_len = len(output.outputs[0].token_ids)
+                output_ids = list(output.outputs[0].token_ids) + [pad_token_id] * (batch_max_output_len - output_len)
 
-        return rollout_samples
+                # concat input and output
+                sequences.append(input_ids + output_ids)
+
+            sequences = torch.tensor(sequences)
+            sequences, attention_mask, action_mask = process_sequences(
+                sequences, batch_max_input_len, eos_token_id, pad_token_id
+            )
+            sequences = sequences.to("cpu")
+            attention_mask = attention_mask.to("cpu")
+            action_mask = action_mask.to("cpu")
+            response_length = action_mask.float().sum(dim=-1)
+            total_length = attention_mask.float().sum(dim=-1)
+            visual_inputs = self.data_processor(batch_prompts, self.prompt_max_len, device="cpu")
+            rollout_samples = Samples(
+                sequences=sequences,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                response_length=response_length,
+                total_length=total_length,
+                prompts=batch_prompts,
+                visual_inputs=visual_inputs,
+                labels=batch_labels,
+            )
+            samples_list.append(rollout_samples)
+
+        return samples_list
