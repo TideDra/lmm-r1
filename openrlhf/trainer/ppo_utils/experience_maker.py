@@ -124,6 +124,7 @@ class Samples:
     prompts: list[str]
     visual_inputs: MMInputs
     labels: list[str]
+    action_log_probs: torch.Tensor
 
     def __init__(
         self,
@@ -136,6 +137,7 @@ class Samples:
         visual_inputs=None,
         labels=None,
         packed_seq_lens=None,
+        action_log_probs=None,
     ):
         self.sequences = sequences
         self.attention_mask = attention_mask
@@ -146,14 +148,16 @@ class Samples:
         self.labels = labels or []
         self.visual_inputs = visual_inputs
         self.packed_seq_lens = packed_seq_lens
+        self.action_log_probs = action_log_probs
 
     def split(self, split_size: int, data_processor: BaseDataProcessor):
         sequences_list = self.sequences.split(split_size, dim=0)
         attention_mask_list = self.attention_mask.split(split_size, dim=0)
         action_mask_list = self.action_mask.split(split_size, dim=0)
+        action_log_probs_list = self.action_log_probs.split(split_size, dim=0)
         visual_inputs_list = data_processor.split_input_batch(self.visual_inputs, split_size)
         sample_list = []
-        for i, (seq, mask, action_mask) in enumerate(zip(sequences_list, attention_mask_list, action_mask_list)):
+        for i, (seq, mask, action_mask, action_log_probs) in enumerate(zip(sequences_list, attention_mask_list, action_mask_list, action_log_probs_list)):
             sample = Samples()
             sample.sequences = seq
             sample.attention_mask = mask
@@ -162,6 +166,7 @@ class Samples:
             sample.total_length = sample.attention_mask.float().sum(dim=-1)
             sample.prompts = self.prompts[i * split_size : (i + 1) * split_size]
             sample.labels = self.labels[i * split_size : (i + 1) * split_size]
+            sample.action_log_probs = action_log_probs
             sample.visual_inputs = data_processor.make_input_batch(visual_inputs_list[i * split_size : (i + 1) * split_size])
             sample_list.append(sample)
         return sample_list
@@ -181,6 +186,7 @@ class RemoteExperienceMaker(ABC):
         strategy=None,
         remote_rm_url: Union[list[str], str] = None,
         custom_experience_filter:str=None,
+        lambda_generator:str=None,
         vllm_engines: List = None,
         packing_samples=False,
         **kwargs,
@@ -224,6 +230,17 @@ class RemoteExperienceMaker(ABC):
             experience_filter_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(experience_filter_module)
             self.custom_experience_filter = experience_filter_module.experience_filter
+        self.lambda_generator = None
+        if lambda_generator:
+            if not lambda_generator.endswith(".py"):
+                raise ValueError(f"lambda_generator must be a python file, got {lambda_generator}")
+            print(f"Loading custom `lambda_generator(self)` from {lambda_generator}")
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("lambda_generator", lambda_generator)
+            lambda_generator_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(lambda_generator_module)
+            self.lambda_generator = lambda_generator_module.lambda_generator
 
     @torch.no_grad()
     def make_experience_list(
@@ -244,7 +261,7 @@ class RemoteExperienceMaker(ABC):
 
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-        rollout_samples = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
+        rollout_samples = self.generate_samples(all_prompts, all_labels, ensemble=True, **generate_kwargs)
 
         # vLLM offload when vllm_enable_sleep
         if self.strategy.args.vllm_enable_sleep:
@@ -277,6 +294,7 @@ class RemoteExperienceMaker(ABC):
         prompts_list = [p for s in samples_list for p in s.prompts]
         labels_list = [l for s in samples_list for l in s.labels]
         visual_inputs_list = [s.visual_inputs for s in samples_list]
+        action_log_probs_list = [s.action_log_probs for s in samples_list]
 
         # Batch call reward model
         r_refs = None
@@ -329,6 +347,7 @@ class RemoteExperienceMaker(ABC):
             ray.get(r_refs)
             ray.get(self.reward_model_group.async_run_method(method_name="empty_cache"))
 
+        """
         # Batch call actor model
         action_log_probs_ref = self.actor_model_group.async_run_method_batch(
             method_name="forward",
@@ -342,7 +361,7 @@ class RemoteExperienceMaker(ABC):
         if args.colocate_all_models or args.colocate_actor_ref:
             ray.get(action_log_probs_ref)
             ray.get(self.actor_model_group.async_run_method(method_name="empty_cache"))
-
+        """
         # Batch call critic model
         if self.critic_model_group is not None:
             if args.colocate_critic_reward and not self.remote_rm_url:
@@ -383,7 +402,7 @@ class RemoteExperienceMaker(ABC):
         # Wait for all remote calls to complete and flatten the results
         # Note: the results duplicated ring_attn_size * ds_tensor_parallel_size times
         duplicate_factor = args.ring_attn_size * args.ds_tensor_parallel_size
-        action_log_probs_list = sum(ray.get(action_log_probs_ref)[::duplicate_factor], [])
+        #action_log_probs_list = sum(ray.get(action_log_probs_ref)[::duplicate_factor], [])
         base_action_log_probs_list = sum(ray.get(base_action_log_probs_ref)[::duplicate_factor], [])
         value_list = sum(ray.get(value_ref)[::duplicate_factor], [])
         rewards_list = ray.get(r_refs)
@@ -637,7 +656,7 @@ class RemoteExperienceMaker(ABC):
         return returns
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels, ensemble=True, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -648,27 +667,18 @@ class RemoteExperienceMaker(ABC):
             return self._generate_with_hf(all_prompts, all_labels, **generate_kwargs)
 
         # vLLM generation
-        return self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+        return self._generate_vllm(all_prompts, all_labels, ensemble, **generate_kwargs)
 
     @torch.no_grad()
     def _generate_with_hf(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
         raise NotImplementedError("HF generation is not implemented yet")
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Samples]:
+    def _generate_vllm(self, all_prompts: List[str], all_labels,ensemble=True, **kwargs) -> List[Samples]:
         from vllm import SamplingParams
 
         llms = self.vllm_engines
         args = self.strategy.args
 
-        sampling_params = SamplingParams(
-            temperature=kwargs.get("temperature", 1.0),
-            top_p=kwargs.get("top_p", 1.0),
-            top_k=kwargs.get("top_k", -1),
-            max_tokens=kwargs.get("max_new_tokens", 1024),
-            min_tokens=kwargs.get("min_new_tokens", 1),
-            skip_special_tokens=kwargs.get("skip_special_tokens", False),
-            include_stop_str_in_output=True,
-        )
 
         # Expand prompt list based on the number of samples per prompt
         n_samples_per_prompt = kwargs.pop("n_samples_per_prompt", args.n_samples_per_prompt)
@@ -676,11 +686,26 @@ class RemoteExperienceMaker(ABC):
         all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
         batch_size = (len(all_prompts) + len(llms) - 1) // len(llms)
 
+        all_sampling_params = [
+            SamplingParams(
+                temperature=kwargs.get("temperature", 1.0),
+                top_p=kwargs.get("top_p", 1.0),
+                top_k=kwargs.get("top_k", -1),
+                max_tokens=kwargs.get("max_new_tokens", 1024),
+                min_tokens=kwargs.get("min_new_tokens", 1),
+                skip_special_tokens=kwargs.get("skip_special_tokens", False),
+                include_stop_str_in_output=True,
+                extra_args=self.lambda_generator(self) if ensemble else None,
+                logprobs=0
+            ) for _ in range(len(all_prompts))
+        ]
+
         # Distribute requests to engines and collect responses to outputs
         refs = []
         # For VLM
         for i, llm in enumerate(llms):
             messages = all_prompts[i * batch_size : (i + 1) * batch_size]
+            sampling_params = all_sampling_params[i * batch_size : (i + 1) * batch_size]
             if messages:
                 prompts = self.data_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 images = [self.data_processor.get_images_from_messages(m) for m in messages]
@@ -716,25 +741,31 @@ class RemoteExperienceMaker(ABC):
             batch_max_output_len = max(len(output.outputs[0].token_ids) for output in batch_outputs)
 
             sequences = []
+            logprobs = []
             for output in batch_outputs:
                 # left padding input
                 input_len = len(output.prompt_token_ids)
                 input_ids = [pad_token_id] * (batch_max_input_len - input_len) + list(output.prompt_token_ids)
-
+                #we don't need input logprobs
+                input_logprobs= [0] * len(input_ids)
                 # right padding output
                 output_len = len(output.outputs[0].token_ids)
                 output_ids = list(output.outputs[0].token_ids) + [pad_token_id] * (batch_max_output_len - output_len)
+                output_logprobs = [list(logprobs.values())[0].logprob for logprobs in output.outputs[0].logprobs] + [0] * (batch_max_output_len - output_len)
 
                 # concat input and output
                 sequences.append(input_ids + output_ids)
-
+                logprobs.append(input_logprobs + output_logprobs)
             sequences = torch.tensor(sequences)
+            logprobs = torch.tensor(logprobs)
             sequences, attention_mask, action_mask = process_sequences(
                 sequences, batch_max_input_len, eos_token_id, pad_token_id
             )
+            action_logprobs = logprobs[:, -action_mask.shape[1] :] * action_mask.float()
             sequences = sequences.to("cpu")
             attention_mask = attention_mask.to("cpu")
             action_mask = action_mask.to("cpu")
+            action_logprobs = action_logprobs.to("cpu")
             response_length = action_mask.float().sum(dim=-1)
             total_length = attention_mask.float().sum(dim=-1)
             visual_inputs = self.data_processor(batch_prompts, self.prompt_max_len, device="cpu")
@@ -747,6 +778,7 @@ class RemoteExperienceMaker(ABC):
                 prompts=batch_prompts,
                 visual_inputs=visual_inputs,
                 labels=batch_labels,
+                action_log_probs=action_logprobs
             )
             samples_list.append(rollout_samples)
 

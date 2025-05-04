@@ -62,6 +62,10 @@ def train(args):
             args.vllm_gpu_memory_utilization,
             args.vllm_enable_sleep,
             limit_mm_per_prompt=args.limit_mm_per_prompt,
+            spec_decoding_acceptance_method="ensemble_sampler",
+            speculative_model=args.draft_pretrain,
+            num_speculative_tokens=args.num_speculative_tokens,
+            disable_logprobs_during_spec_decoding=False,
             **args.vllm_engine_kwargs
         )
 
@@ -235,7 +239,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--limit_mm_per_prompt", type=str, default=None, help="Limit the number of multimodal inputs per prompt")
     parser.add_argument("--vllm_engine_kwargs", type=str, default=None, help="vLLM engine kwargs")
-
+    parser.add_argument("--lambda_generator", type=str, default=None, help="Lambda generator")
+    parser.add_argument("--num_speculative_tokens", type=int, default=5, help="Number of speculative tokens for vLLM")
+    parser.add_argument("--draft_pretrain", type=str, default=None, help="Draft model for vLLM")
     # Checkpoints
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--save_steps", type=int, default=-1)
@@ -304,6 +310,7 @@ if __name__ == "__main__":
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
     parser.add_argument("--eps_clip", type=float, default=0.2, help="PPO clip range")
     parser.add_argument("--value_clip", type=float, default=0.2, help="PPO value clip range")
+    parser.add_argument("--normalize_importance_weights", action="store_true", default=False, help="Normalize importance weights")
     parser.add_argument("--lambd", type=float, default=1, help="PPO GAE lambd")
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
     parser.add_argument("--micro_train_batch_size", type=int, default=4, help="batch size per GPU")

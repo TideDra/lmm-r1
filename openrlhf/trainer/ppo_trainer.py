@@ -67,6 +67,7 @@ class PPOTrainer(ABC):
         self.max_epochs = self.args.max_epochs
         self.remote_rm_url = self.args.remote_rm_url
         self.custom_experience_filter = self.args.custom_experience_filter
+        self.lambda_generator = self.args.lambda_generator
         self.init_kl_coef = self.args.init_kl_coef
         self.kl_target = self.args.kl_target
         self.kl_horizon = self.args.kl_horizon
@@ -90,6 +91,7 @@ class PPOTrainer(ABC):
             self.strategy,
             self.remote_rm_url,
             self.custom_experience_filter,
+            lambda_generator=self.lambda_generator,
             vllm_engines=self.vllm_engines,
             packing_samples=self.strategy.args.packing_samples,
         )
@@ -127,8 +129,8 @@ class PPOTrainer(ABC):
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
-            wandb.define_metric("eval/epoch")
-            wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            wandb.define_metric("eval/global_step")
+            wandb.define_metric("eval/*", step_metric="eval/global_step", step_sync=True)
             self.generated_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
@@ -362,7 +364,7 @@ class PPOTrainer(ABC):
             generate_kwargs = self.generate_kwargs.copy()
             generate_kwargs["temperature"] = temperature
             generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
-            samples_list = self.experience_maker.generate_samples(all_prompts, all_labels, **generate_kwargs)
+            samples_list = self.experience_maker.generate_samples(all_prompts, all_labels, ensemble=False, **generate_kwargs)
             queries_list = sum(
                 [self.tokenizer.batch_decode(s.sequences, skip_special_tokens=False) for s in samples_list], []
             )
