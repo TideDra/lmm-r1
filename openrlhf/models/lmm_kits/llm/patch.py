@@ -30,7 +30,7 @@ class LLMPatch(BasePatch):
             return hacked_position_ids
         PreTrainedModel.offset_split_position_ids = offset_split_position_ids
     
-    def apply_liger_kernel():
+    def apply_liger_kernel(self):
         # For LLM, we directly apply liger_kernel in get_generation_cls
         pass
     

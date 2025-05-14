@@ -53,7 +53,7 @@ class Phi4MMPatch(BasePatch):
         torch.nn.MultiheadAttention = HackedMultiheadAttention
                     
     
-    def apply_liger_kernel():
+    def apply_liger_kernel(self):
         from liger_kernel.transformers import LigerPhi3SwiGLUMLP, LigerRMSNorm, liger_rotary_pos_emb
         from .src import modeling_phi4mm
         modeling_phi4mm.Phi4MMMLP = LigerPhi3SwiGLUMLP

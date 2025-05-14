@@ -34,7 +34,7 @@ class Phi3_VPatch(BasePatch):
             return hacked_position_ids
         Phi3VForCausalLM.offset_split_position_ids = offset_split_position_ids
     
-    def apply_liger_kernel():
+    def apply_liger_kernel(self):
         from liger_kernel.transformers import LigerPhi3SwiGLUMLP, LigerRMSNorm, liger_rotary_pos_emb
         from .src import modeling_phi3_v
         modeling_phi3_v.Phi3MLP = LigerPhi3SwiGLUMLP

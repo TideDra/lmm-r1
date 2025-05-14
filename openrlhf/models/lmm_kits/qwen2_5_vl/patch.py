@@ -82,7 +82,7 @@ class Qwen2_5_VLPatch(BasePatch):
             return new_position_ids
         Qwen2_5_VLForConditionalGeneration.offset_split_position_ids = offset_split_position_ids
     
-    def apply_liger_kernel():
+    def apply_liger_kernel(self):
         from liger_kernel.transformers import apply_liger_kernel_to_qwen2_5_vl
         apply_liger_kernel_to_qwen2_5_vl()
 
